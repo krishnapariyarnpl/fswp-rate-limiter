@@ -76,6 +76,7 @@ final class FSWP_Rate_Limiter {
 			'exempt_wp_admin'     => 0,
 			'exempt_admins'       => 1,
 			'whitelist_ips'       => '',
+			'excluded_urls'       => '',
 
 			'general_enabled'     => 1,
 			'general_limit'       => 300,   // requests
@@ -85,11 +86,6 @@ final class FSWP_Rate_Limiter {
 			'browser_block_enabled' => 0,
 			'browser_min_version'   => 0,
 			'blocked_useragents'    => '',
-
-			'login_enabled'       => 1,
-			'login_limit'         => 5,     // requests
-			'login_window'        => 300,   // seconds (5 min)
-			'login_mitigation'    => 900,   // seconds blocked once tripped (15 min)
 		);
 	}
 
@@ -127,6 +123,10 @@ final class FSWP_Rate_Limiter {
 			return;
 		}
 
+		if ( $this->is_excluded_url() ) {
+			return;
+		}
+
 		$this->enforce_limit(
 			'general',
 			$ip,
@@ -134,16 +134,6 @@ final class FSWP_Rate_Limiter {
 			(int) $this->settings['general_window'],
 			(int) $this->settings['general_mitigation']
 		);
-
-		if ( $this->is_login_or_xmlrpc_request() && ! empty( $this->settings['login_enabled'] ) ) {
-			$this->enforce_limit(
-				'login',
-				$ip,
-				(int) $this->settings['login_limit'],
-				(int) $this->settings['login_window'],
-				(int) $this->settings['login_mitigation']
-			);
-		}
 	}
 
 	/**
@@ -364,12 +354,38 @@ final class FSWP_Rate_Limiter {
 	 * Request classification helpers
 	 * ------------------------------------------------------------------- */
 
-	private function is_login_or_xmlrpc_request() {
-		if ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST ) {
-			return true;
+	/**
+	 * Check the current request path against the admin-configured exclusion
+	 * list. Supports plain substring matches (e.g. "/wp-json/") and simple
+	 * wildcard patterns using "*" (e.g. "/feed*", "*.xml").
+	 */
+	private function is_excluded_url() {
+		$patterns = array_filter( array_map( 'trim', explode( "\n", (string) $this->settings['excluded_urls'] ) ) );
+		if ( empty( $patterns ) ) {
+			return false;
 		}
-		$script = isset( $_SERVER['SCRIPT_NAME'] ) ? basename( $_SERVER['SCRIPT_NAME'] ) : '';
-		return in_array( $script, array( 'wp-login.php', 'xmlrpc.php' ), true );
+
+		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '';
+		$path = wp_parse_url( $uri, PHP_URL_PATH );
+		if ( null === $path || false === $path ) {
+			$path = $uri;
+		}
+
+		foreach ( $patterns as $pattern ) {
+			if ( '' === $pattern ) {
+				continue;
+			}
+			if ( false !== strpos( $pattern, '*' ) ) {
+				$regex = '#^' . str_replace( '\*', '.*', preg_quote( $pattern, '#' ) ) . '$#i';
+				if ( preg_match( $regex, $path ) ) {
+					return true;
+				}
+			} elseif ( false !== strpos( $path, $pattern ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private function is_wp_admin_request() {
@@ -457,9 +473,7 @@ final class FSWP_Rate_Limiter {
 
 	private function clear_block_state_for_ip( $ip ) {
 		$hash = md5( $ip );
-		foreach ( array( 'general', 'login' ) as $bucket ) {
-			$this->cache_delete( "fswp_rate_limiter_block_{$bucket}_{$hash}" );
-		}
+		$this->cache_delete( "fswp_rate_limiter_block_general_{$hash}" );
 	}
 
 	public function sanitize_settings( $input ) {
@@ -472,6 +486,9 @@ final class FSWP_Rate_Limiter {
 		$out['whitelist_ips']     = isset( $input['whitelist_ips'] )
 			? implode( "\n", array_filter( array_map( 'trim', explode( "\n", sanitize_textarea_field( $input['whitelist_ips'] ) ) ) ) )
 			: '';
+		$out['excluded_urls']     = isset( $input['excluded_urls'] )
+			? implode( "\n", array_filter( array_map( 'trim', explode( "\n", sanitize_textarea_field( $input['excluded_urls'] ) ) ) ) )
+			: '';
 
 		$out['general_enabled']    = empty( $input['general_enabled'] ) ? 0 : 1;
 		$out['general_limit']      = max( 1, (int) ( $input['general_limit'] ?? $defaults['general_limit'] ) );
@@ -483,11 +500,6 @@ final class FSWP_Rate_Limiter {
 		$out['blocked_useragents']    = isset( $input['blocked_useragents'] )
 			? implode( "\n", array_filter( array_map( 'trim', explode( "\n", sanitize_textarea_field( $input['blocked_useragents'] ) ) ) ) )
 			: '';
-
-		$out['login_enabled']    = empty( $input['login_enabled'] ) ? 0 : 1;
-		$out['login_limit']      = max( 1, (int) ( $input['login_limit'] ?? $defaults['login_limit'] ) );
-		$out['login_window']     = max( 1, (int) ( $input['login_window'] ?? $defaults['login_window'] ) );
-		$out['login_mitigation'] = max( 1, (int) ( $input['login_mitigation'] ?? $defaults['login_mitigation'] ) );
 
 		return $out;
 	}
@@ -528,6 +540,13 @@ final class FSWP_Rate_Limiter {
 					<tr>
 						<th scope="row">Exempt logged-in administrators</th>
 						<td><label><input type="checkbox" name="<?php echo FSWP_RATE_LIMITER_OPTION; ?>[exempt_admins]" value="1" <?php checked( $s['exempt_admins'], 1 ); ?> /> Users who can <code>manage_options</code> are never blocked.</label></td>
+					</tr>
+					<tr>
+						<th scope="row">Excluded URLs</th>
+						<td>
+							<textarea name="<?php echo FSWP_RATE_LIMITER_OPTION; ?>[excluded_urls]" rows="4" cols="40" class="large-text code"><?php echo esc_textarea( $s['excluded_urls'] ); ?></textarea>
+							<p class="description">One path per line, matched against the request URI. Use <code>*</code> as a wildcard (e.g. <code>/wp-json/*</code>) or a plain fragment for a substring match (e.g. <code>/feed</code>). Matching requests are never counted toward the site-wide limit.</p>
+						</td>
 					</tr>
 				</table>
 
@@ -575,27 +594,6 @@ final class FSWP_Rate_Limiter {
 							<textarea name="<?php echo FSWP_RATE_LIMITER_OPTION; ?>[blocked_useragents]" rows="4" cols="40" class="large-text code"><?php echo esc_textarea( $s['blocked_useragents'] ); ?></textarea>
 							<p class="description">One user-agent fragment per line. Requests containing any of these strings will be blocked.</p>
 						</td>
-					</tr>
-				</table>
-
-				<h2>Login &amp; XML-RPC limit</h2>
-				<table class="form-table" role="presentation">
-					<tr>
-						<th scope="row">Enabled</th>
-						<td><label><input type="checkbox" name="<?php echo FSWP_RATE_LIMITER_OPTION; ?>[login_enabled]" value="1" <?php checked( $s['login_enabled'], 1 ); ?> /> Rate limit <code>wp-login.php</code> and <code>xmlrpc.php</code> per IP.</label></td>
-					</tr>
-					<tr>
-						<th scope="row">Limit</th>
-						<td>
-							<input type="number" min="1" name="<?php echo FSWP_RATE_LIMITER_OPTION; ?>[login_limit]" value="<?php echo esc_attr( $s['login_limit'] ); ?>" class="small-text" />
-							requests per
-							<input type="number" min="1" name="<?php echo FSWP_RATE_LIMITER_OPTION; ?>[login_window]" value="<?php echo esc_attr( $s['login_window'] ); ?>" class="small-text" />
-							seconds, per IP.
-						</td>
-					</tr>
-					<tr>
-						<th scope="row">Block duration</th>
-						<td><input type="number" min="1" name="<?php echo FSWP_RATE_LIMITER_OPTION; ?>[login_mitigation]" value="<?php echo esc_attr( $s['login_mitigation'] ); ?>" class="small-text" /> seconds.</td>
 					</tr>
 				</table>
 
