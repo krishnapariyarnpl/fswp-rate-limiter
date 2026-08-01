@@ -34,6 +34,68 @@ final class FSWP_Crawler {
 		return isset( $weights[ $path ]['weight'] ) ? max( 1, (int) $weights[ $path ]['weight'] ) : 1;
 	}
 
+	/**
+	 * Enumerate every public endpoint on the site: the front page, every
+	 * published entry of every public post type, and every term archive of
+	 * every public taxonomy. Cheap — no HTTP requests, just querying the
+	 * site's own structure — so it's safe to run synchronously; the actual
+	 * crawling of each URL happens separately, in small AJAX batches.
+	 */
+	public static function discover_endpoints() {
+		$urls = array( home_url( '/' ) );
+
+		$post_types = get_post_types( array( 'public' => true ), 'names' );
+		unset( $post_types['attachment'] );
+
+		if ( ! empty( $post_types ) ) {
+			$paged = 1;
+			do {
+				$query = new WP_Query( array(
+					'post_type'              => array_values( $post_types ),
+					'post_status'            => 'publish',
+					'posts_per_page'         => 200,
+					'paged'                  => $paged,
+					'fields'                 => 'ids',
+					'orderby'                => 'ID',
+					'order'                  => 'ASC',
+					'update_post_meta_cache' => false,
+					'update_post_term_cache' => false,
+					'no_found_rows'          => false,
+				) );
+
+				foreach ( $query->posts as $post_id ) {
+					$link = get_permalink( $post_id );
+					if ( $link ) {
+						$urls[] = $link;
+					}
+				}
+
+				$max_pages = $query->max_num_pages;
+				$paged++;
+			} while ( $paged <= $max_pages );
+		}
+
+		$taxonomies = get_taxonomies( array( 'public' => true ), 'names' );
+		foreach ( $taxonomies as $taxonomy ) {
+			$terms = get_terms( array(
+				'taxonomy'   => $taxonomy,
+				'hide_empty' => true,
+				'fields'     => 'ids',
+			) );
+			if ( is_wp_error( $terms ) ) {
+				continue;
+			}
+			foreach ( $terms as $term_id ) {
+				$link = get_term_link( (int) $term_id, $taxonomy );
+				if ( ! is_wp_error( $link ) ) {
+					$urls[] = $link;
+				}
+			}
+		}
+
+		return array_values( array_unique( $urls ) );
+	}
+
 	public static function remove( array $paths ) {
 		$weights = self::get_weights();
 		foreach ( $paths as $path ) {

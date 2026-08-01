@@ -1,6 +1,7 @@
 <?php
 /**
- * Settings screen: Settings -> Rate Limiting.
+ * Admin screens: FSWP Rate Limiter's own top-level menu, with a Settings
+ * page and a separate URL Weights (crawler) dashboard.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -9,30 +10,87 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class FSWP_Admin {
 
+	const CRAWL_BATCH_SIZE      = 5;
+	const DISCOVERED_URLS_KEY   = 'fswp_rate_limiter_discovered_urls';
+	const AJAX_NONCE_ACTION     = 'fswp_rate_limiter_crawler';
+
 	/** @var FSWP_Rate_Limiter */
 	private $rate_limiter;
 
 	/** @var string */
 	private $notice = '';
 
+	/** @var string */
+	private $weights_page_hook = '';
+
 	public function __construct( FSWP_Rate_Limiter $rate_limiter ) {
 		$this->rate_limiter = $rate_limiter;
 
-		add_action( 'admin_menu', array( $this, 'register_settings_page' ) );
+		add_action( 'admin_menu', array( $this, 'register_menu' ) );
 		add_action( 'admin_init', array( $this, 'register_settings' ) );
 		add_action( 'admin_init', array( $this, 'handle_blocked_ip_removals' ) );
 		add_action( 'admin_init', array( $this, 'handle_crawl_url' ) );
 		add_action( 'admin_init', array( $this, 'handle_weight_removals' ) );
+		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_assets' ) );
+
+		add_action( 'wp_ajax_fswp_discover_endpoints', array( $this, 'ajax_discover_endpoints' ) );
+		add_action( 'wp_ajax_fswp_crawl_batch', array( $this, 'ajax_crawl_batch' ) );
 	}
 
-	public function register_settings_page() {
-		add_options_page(
-			__( 'Rate Limiting', 'fswp-rate-limiter' ),
-			__( 'Rate Limiting', 'fswp-rate-limiter' ),
+	public function register_menu() {
+		add_menu_page(
+			__( 'FSWP Rate Limiter', 'fswp-rate-limiter' ),
+			__( 'Rate Limiter', 'fswp-rate-limiter' ),
+			'manage_options',
+			'fswp-rate-limiter-settings',
+			array( $this, 'render_settings_page' ),
+			'dashicons-shield',
+			80
+		);
+
+		add_submenu_page(
+			'fswp-rate-limiter-settings',
+			__( 'Settings', 'fswp-rate-limiter' ),
+			__( 'Settings', 'fswp-rate-limiter' ),
 			'manage_options',
 			'fswp-rate-limiter-settings',
 			array( $this, 'render_settings_page' )
 		);
+
+		$this->weights_page_hook = (string) add_submenu_page(
+			'fswp-rate-limiter-settings',
+			__( 'URL Weights', 'fswp-rate-limiter' ),
+			__( 'URL Weights', 'fswp-rate-limiter' ),
+			'manage_options',
+			'fswp-rate-limiter-weights',
+			array( $this, 'render_weights_page' )
+		);
+	}
+
+	public function enqueue_assets( $hook ) {
+		if ( $hook !== $this->weights_page_hook ) {
+			return;
+		}
+
+		wp_enqueue_script(
+			'fswp-rate-limiter-crawler',
+			plugins_url( 'assets/js/admin-crawler.js', FSWP_RATE_LIMITER_FILE ),
+			array(),
+			FSWP_RATE_LIMITER_VERSION,
+			true
+		);
+
+		wp_localize_script( 'fswp-rate-limiter-crawler', 'fswpCrawler', array(
+			'ajaxUrl'       => admin_url( 'admin-ajax.php' ),
+			'nonce'         => wp_create_nonce( self::AJAX_NONCE_ACTION ),
+			'discovering'   => __( 'Discovering endpoints…', 'fswp-rate-limiter' ),
+			'noneFound'     => __( 'No endpoints found.', 'fswp-rate-limiter' ),
+			'error'         => __( 'Something went wrong. Please try again.', 'fswp-rate-limiter' ),
+			'progressLabel' => __( 'Crawled', 'fswp-rate-limiter' ),
+			'doneLabel'     => __( 'Done — crawled', 'fswp-rate-limiter' ),
+			'ofLabel'       => __( 'of', 'fswp-rate-limiter' ),
+			'endpointsLabel' => __( 'endpoints.', 'fswp-rate-limiter' ),
+		) );
 	}
 
 	public function register_settings() {
@@ -100,6 +158,53 @@ final class FSWP_Admin {
 		FSWP_Crawler::remove( $selected );
 	}
 
+	/**
+	 * Step 1 of the auto-crawl: enumerate every endpoint and stash the list
+	 * in a transient so the batch requests that follow don't have to
+	 * re-query the whole site each time.
+	 */
+	public function ajax_discover_endpoints() {
+		check_ajax_referer( self::AJAX_NONCE_ACTION, 'nonce' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Permission denied.', 'fswp-rate-limiter' ) ), 403 );
+		}
+
+		$urls = FSWP_Crawler::discover_endpoints();
+		set_transient( self::DISCOVERED_URLS_KEY, $urls, HOUR_IN_SECONDS );
+
+		wp_send_json_success( array( 'total' => count( $urls ) ) );
+	}
+
+	/**
+	 * Step 2: crawl a handful of the discovered URLs per call. The browser
+	 * drives the loop (see assets/js/admin-crawler.js), calling this
+	 * repeatedly until every URL is processed — that keeps each individual
+	 * request short enough to never hit PHP's max_execution_time, even on
+	 * a site with thousands of URLs.
+	 */
+	public function ajax_crawl_batch() {
+		check_ajax_referer( self::AJAX_NONCE_ACTION, 'nonce' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Permission denied.', 'fswp-rate-limiter' ) ), 403 );
+		}
+
+		$offset = isset( $_POST['offset'] ) ? max( 0, (int) $_POST['offset'] ) : 0;
+		$urls   = get_transient( self::DISCOVERED_URLS_KEY );
+		if ( ! is_array( $urls ) ) {
+			wp_send_json_error( array( 'message' => __( 'Discovery expired, please start again.', 'fswp-rate-limiter' ) ) );
+		}
+
+		$batch = array_slice( $urls, $offset, self::CRAWL_BATCH_SIZE );
+		foreach ( $batch as $url ) {
+			FSWP_Crawler::crawl( $url );
+		}
+
+		wp_send_json_success( array(
+			'processed' => min( $offset + count( $batch ), count( $urls ) ),
+			'total'     => count( $urls ),
+		) );
+	}
+
 	public function sanitize_settings( $input ) {
 		$defaults = FSWP_Rate_Limiter::default_settings();
 		$out      = array();
@@ -124,6 +229,9 @@ final class FSWP_Admin {
 		$out['blocked_useragents']    = isset( $input['blocked_useragents'] )
 			? implode( "\n", array_filter( array_map( 'trim', explode( "\n", sanitize_textarea_field( $input['blocked_useragents'] ) ) ) ) )
 			: '';
+		$out['allowed_useragents']    = isset( $input['allowed_useragents'] )
+			? implode( "\n", array_filter( array_map( 'trim', explode( "\n", sanitize_textarea_field( $input['allowed_useragents'] ) ) ) ) )
+			: '';
 
 		return $out;
 	}
@@ -136,7 +244,7 @@ final class FSWP_Admin {
 		$using_object_cache = wp_using_ext_object_cache();
 		?>
 		<div class="wrap">
-			<h1><?php esc_html_e( 'Rate Limiting', 'fswp-rate-limiter' ); ?></h1>
+			<h1><?php esc_html_e( 'FSWP Rate Limiter', 'fswp-rate-limiter' ); ?></h1>
 			<?php if ( '' !== $this->notice ) : ?>
 				<div class="notice notice-info is-dismissible"><p><?php echo esc_html( $this->notice ); ?></p></div>
 			<?php endif; ?>
@@ -223,6 +331,13 @@ final class FSWP_Admin {
 							<p class="description"><?php esc_html_e( 'One user-agent fragment per line. Requests containing any of these strings will be blocked.', 'fswp-rate-limiter' ); ?></p>
 						</td>
 					</tr>
+					<tr>
+						<th scope="row"><?php esc_html_e( 'Always-allowed user-agents', 'fswp-rate-limiter' ); ?></th>
+						<td>
+							<textarea name="<?php echo esc_attr( FSWP_RATE_LIMITER_OPTION ); ?>[allowed_useragents]" rows="6" cols="40" class="large-text code"><?php echo esc_textarea( $s['allowed_useragents'] ); ?></textarea>
+							<p class="description"><?php esc_html_e( 'One user-agent fragment per line. Requests whose User-Agent contains any of these strings skip both the rate limit and the browser/user-agent blocker entirely — pre-filled with common legitimate search-engine, social-preview, and uptime-monitor bots. Note: the User-Agent header is sent by the client and can be faked by anyone, so this is a convenience allowlist for known-good automated traffic, not a verified identity check.', 'fswp-rate-limiter' ); ?></p>
+						</td>
+					</tr>
 				</table>
 
 				<?php submit_button(); ?>
@@ -261,9 +376,30 @@ final class FSWP_Admin {
 					<?php submit_button( __( 'Remove selected IPs', 'fswp-rate-limiter' ), 'secondary', 'submit', false ); ?>
 				</p>
 			</form>
+		</div>
+		<?php
+	}
 
-			<h2><?php esc_html_e( 'URL request weights', 'fswp-rate-limiter' ); ?></h2>
+	public function render_weights_page() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+		?>
+		<div class="wrap">
+			<h1><?php esc_html_e( 'URL Weights', 'fswp-rate-limiter' ); ?></h1>
+			<?php if ( '' !== $this->notice ) : ?>
+				<div class="notice notice-info is-dismissible"><p><?php echo esc_html( $this->notice ); ?></p></div>
+			<?php endif; ?>
 			<p><?php esc_html_e( "Crawl a URL to record how many resource requests (images, scripts, stylesheets, etc.) one page load generates. When that URL is hit, the general limit counter is incremented by that number instead of 1 — approximating each page's real request cost, since WordPress itself never sees the browser's individual asset requests.", 'fswp-rate-limiter' ); ?></p>
+
+			<h2><?php esc_html_e( 'Auto-crawl the whole site', 'fswp-rate-limiter' ); ?></h2>
+			<p><?php esc_html_e( 'Discovers every published post, page, custom post type entry, and public taxonomy archive on the site, then crawls each one a few at a time in the background to record its weight. Safe for large sites — it never processes more than a handful of URLs per request, so it can\'t time out.', 'fswp-rate-limiter' ); ?></p>
+			<p>
+				<button type="button" id="fswp-auto-crawl-start" class="button button-primary"><?php esc_html_e( 'Start auto-crawl', 'fswp-rate-limiter' ); ?></button>
+				<span id="fswp-auto-crawl-progress"></span>
+			</p>
+
+			<h2><?php esc_html_e( 'Crawl a single URL', 'fswp-rate-limiter' ); ?></h2>
 			<form method="post" action="">
 				<?php wp_nonce_field( 'fswp_rate_limiter_crawl_url' ); ?>
 				<input type="hidden" name="fswp_rate_limiter_crawl_url" value="1" />
@@ -271,6 +407,7 @@ final class FSWP_Admin {
 				<?php submit_button( __( 'Crawl & save weight', 'fswp-rate-limiter' ), 'secondary', 'submit', false ); ?>
 			</form>
 
+			<h2><?php esc_html_e( 'Recorded weights', 'fswp-rate-limiter' ); ?></h2>
 			<form method="post" action="">
 				<?php wp_nonce_field( 'fswp_rate_limiter_remove_weights' ); ?>
 				<table class="widefat fixed" role="presentation">

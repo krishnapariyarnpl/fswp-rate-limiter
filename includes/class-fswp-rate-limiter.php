@@ -48,6 +48,39 @@ final class FSWP_Rate_Limiter {
 			'browser_block_enabled' => 0,
 			'browser_min_version'   => 0,
 			'blocked_useragents'    => '',
+			'allowed_useragents'    => implode( "\n", self::default_allowed_useragents() ),
+		);
+	}
+
+	/**
+	 * Common legitimate crawlers/bots that make automated, sometimes-fast
+	 * requests and shouldn't be caught by the general rate limit or the
+	 * browser/user-agent blocker. Note: the User-Agent header is client-
+	 * supplied and trivially spoofable — this is a convenience allowlist,
+	 * not an identity check. Don't rely on it to distinguish a real
+	 * Googlebot request from an attacker sending the same header.
+	 */
+	public static function default_allowed_useragents() {
+		return array(
+			'Googlebot',
+			'Bingbot',
+			'Slurp',
+			'DuckDuckBot',
+			'Baiduspider',
+			'YandexBot',
+			'Applebot',
+			'facebookexternalhit',
+			'Twitterbot',
+			'LinkedInBot',
+			'WhatsApp',
+			'TelegramBot',
+			'Slackbot',
+			'Pingdom',
+			'UptimeRobot',
+			'GTmetrix',
+			'StatusCake',
+			'Google-PageSpeed',
+			'Chrome-Lighthouse',
 		);
 	}
 
@@ -71,6 +104,11 @@ final class FSWP_Rate_Limiter {
 
 		if ( $this->is_whitelisted( $ip ) ) {
 			$this->debug_log( "$ip skipped: whitelisted" );
+			return;
+		}
+
+		if ( $this->is_allowed_user_agent() ) {
+			$this->debug_log( "$ip skipped: allowed user agent" );
 			return;
 		}
 
@@ -369,6 +407,22 @@ final class FSWP_Rate_Limiter {
 	private function is_whitelisted( $ip ) {
 		$list = array_filter( array_map( 'trim', explode( "\n", (string) $this->settings['whitelist_ips'] ) ) );
 		return in_array( $ip, $list, true );
+	}
+
+	private function is_allowed_user_agent() {
+		$user_agent = isset( $_SERVER['HTTP_USER_AGENT'] ) ? (string) $_SERVER['HTTP_USER_AGENT'] : '';
+		if ( '' === $user_agent ) {
+			return false;
+		}
+
+		$ua_lower = strtolower( $user_agent );
+		$patterns = array_filter( array_map( 'trim', explode( "\n", (string) $this->settings['allowed_useragents'] ) ) );
+		foreach ( $patterns as $pattern ) {
+			if ( '' !== $pattern && false !== strpos( $ua_lower, strtolower( $pattern ) ) ) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**
