@@ -42,6 +42,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'FSWP_RATE_LIMITER_VERSION', '1.0.0' );
 define( 'FSWP_RATE_LIMITER_OPTION', 'fswp_rate_limiter_settings' );
+define( 'FSWP_RATE_LIMITER_WEIGHTS_OPTION', 'fswp_rate_limiter_url_weights' );
 
 final class FSWP_Rate_Limiter {
 
@@ -49,6 +50,9 @@ final class FSWP_Rate_Limiter {
 
 	/** @var array */
 	private $settings;
+
+	/** @var string */
+	private $notice = '';
 
 	public static function instance() {
 		if ( null === self::$instance ) {
@@ -68,6 +72,8 @@ final class FSWP_Rate_Limiter {
 		add_action( 'admin_menu', array( $this, 'register_settings_page' ) );
 		add_action( 'admin_init', array( $this, 'register_settings' ) );
 		add_action( 'admin_init', array( $this, 'handle_blocked_ip_removals' ) );
+		add_action( 'admin_init', array( $this, 'handle_crawl_url' ) );
+		add_action( 'admin_init', array( $this, 'handle_weight_removals' ) );
 	}
 
 	public static function default_settings() {
@@ -132,20 +138,25 @@ final class FSWP_Rate_Limiter {
 			return;
 		}
 
+		$weight = $this->get_url_weight( $this->get_request_path() );
+
 		$this->enforce_limit(
 			'general',
 			$ip,
 			(int) $this->settings['general_limit'],
 			(int) $this->settings['general_window'],
-			(int) $this->settings['general_mitigation']
+			(int) $this->settings['general_mitigation'],
+			$weight
 		);
 	}
 
 	/**
 	 * Check (and update) the sliding-window rate for $ip under $bucket,
 	 * and block the request if it's over $limit within $window seconds.
+	 * $weight is how many "requests" this one hit counts as (see
+	 * get_url_weight() — crawled pages can cost more than 1).
 	 */
-	private function enforce_limit( $bucket, $ip, $limit, $window, $mitigation ) {
+	private function enforce_limit( $bucket, $ip, $limit, $window, $mitigation, $weight = 1 ) {
 		if ( $limit <= 0 || $window <= 0 ) {
 			return;
 		}
@@ -159,9 +170,9 @@ final class FSWP_Rate_Limiter {
 			$this->send_429( $mitigation );
 		}
 
-		$rate = $this->sliding_window_rate( $bucket, $ip, $window );
+		$rate = $this->sliding_window_rate( $bucket, $ip, $window, $weight );
 
-		$this->debug_log( "$ip $bucket rate=$rate limit=$limit" );
+		$this->debug_log( "$ip $bucket rate=$rate limit=$limit weight=$weight" );
 
 		if ( $rate > $limit ) {
 			$this->cache_set( $block_key, 1, $mitigation );
@@ -179,20 +190,23 @@ final class FSWP_Rate_Limiter {
 	/**
 	 * Cloudflare-style sliding window approximation:
 	 *   rate ≈ previous_window_count * (1 - elapsed/window) + current_window_count
+	 * $request_weight is added to the current window's counter instead of a
+	 * flat 1, so a page that costs more (see get_url_weight()) drains the
+	 * budget faster than a cheap one.
 	 */
-	private function sliding_window_rate( $bucket, $ip, $window ) {
-		$now       = time();
-		$window_id = (int) floor( $now / $window );
-		$elapsed   = $now % $window;
-		$weight    = 1 - ( $elapsed / $window );
+	private function sliding_window_rate( $bucket, $ip, $window, $request_weight = 1 ) {
+		$now         = time();
+		$window_id   = (int) floor( $now / $window );
+		$elapsed     = $now % $window;
+		$time_weight = 1 - ( $elapsed / $window );
 
 		$current_key  = "fswp_rate_limiter_{$bucket}_" . md5( $ip ) . "_{$window_id}";
 		$previous_key = "fswp_rate_limiter_{$bucket}_" . md5( $ip ) . '_' . ( $window_id - 1 );
 
-		$current  = $this->cache_incr( $current_key, $window * 2 );
+		$current  = $this->cache_incr( $current_key, $window * 2, $request_weight );
 		$previous = (int) $this->cache_get( $previous_key );
 
-		return ( $previous * $weight ) + $current;
+		return ( $previous * $time_weight ) + $current;
 	}
 
 	private function send_429( $retry_after ) {
@@ -318,23 +332,23 @@ final class FSWP_Rate_Limiter {
 
 	private $cache_group = 'fswp_rate_limiter';
 
-	private function cache_incr( $key, $expire ) {
+	private function cache_incr( $key, $expire, $amount = 1 ) {
 		if ( wp_using_ext_object_cache() ) {
 			$added = wp_cache_add( $key, 0, $this->cache_group, $expire );
 			if ( false === $added ) {
 				// Key already existed; make sure it still has an expiry set
 				// (wp_cache_add is a no-op if the key exists).
 			}
-			$value = wp_cache_incr( $key, 1, $this->cache_group );
+			$value = wp_cache_incr( $key, $amount, $this->cache_group );
 			if ( false === $value ) {
-				wp_cache_set( $key, 1, $this->cache_group, $expire );
-				$value = 1;
+				wp_cache_set( $key, $amount, $this->cache_group, $expire );
+				$value = $amount;
 			}
 			return (int) $value;
 		}
 
 		$value = (int) get_transient( $key );
-		$value++;
+		$value += $amount;
 		set_transient( $key, $value, $expire );
 		return $value;
 	}
@@ -368,6 +382,15 @@ final class FSWP_Rate_Limiter {
 	 * Request classification helpers
 	 * ------------------------------------------------------------------- */
 
+	private function get_request_path() {
+		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '';
+		$path = wp_parse_url( $uri, PHP_URL_PATH );
+		if ( null === $path || false === $path ) {
+			$path = $uri;
+		}
+		return $path;
+	}
+
 	/**
 	 * Check the current request path against the admin-configured exclusion
 	 * list. Supports plain substring matches (e.g. "/wp-json/") and simple
@@ -379,11 +402,7 @@ final class FSWP_Rate_Limiter {
 			return false;
 		}
 
-		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '';
-		$path = wp_parse_url( $uri, PHP_URL_PATH );
-		if ( null === $path || false === $path ) {
-			$path = $uri;
-		}
+		$path = $this->get_request_path();
 
 		foreach ( $patterns as $pattern ) {
 			if ( '' === $pattern ) {
@@ -440,6 +459,167 @@ final class FSWP_Rate_Limiter {
 		}
 		$ip = filter_var( $ip, FILTER_VALIDATE_IP );
 		return $ip ? $ip : '0.0.0.0';
+	}
+
+	/* ---------------------------------------------------------------------
+	 * URL request weights: a hit to a crawled URL counts as more than 1
+	 * request toward the general limit, approximating the real number of
+	 * requests one page load generates (HTML doc + its assets), since
+	 * WordPress/PHP never sees the browser's individual asset requests.
+	 * ------------------------------------------------------------------- */
+
+	private function get_url_weights() {
+		$weights = get_option( FSWP_RATE_LIMITER_WEIGHTS_OPTION, array() );
+		return is_array( $weights ) ? $weights : array();
+	}
+
+	private function normalize_weight_path( $url_or_path ) {
+		$path = wp_parse_url( $url_or_path, PHP_URL_PATH );
+		if ( null === $path || false === $path || '' === $path ) {
+			$path = '/';
+		}
+		if ( '/' !== $path ) {
+			$path = rtrim( $path, '/' );
+		}
+		return $path;
+	}
+
+	private function get_url_weight( $path ) {
+		$weights = $this->get_url_weights();
+		$path    = $this->normalize_weight_path( $path );
+		return isset( $weights[ $path ]['weight'] ) ? max( 1, (int) $weights[ $path ]['weight'] ) : 1;
+	}
+
+	/**
+	 * Fetch $url and count how many resource requests loading it generates:
+	 * every <img>, <script>, <link rel=stylesheet|icon|preload|...>,
+	 * <source>, <iframe>, <video>, <audio>, <embed>/<object>, plus each
+	 * entry in a srcset, and the document itself. This can't see requests
+	 * that JavaScript fires after load (that needs a real browser engine,
+	 * not available from plain PHP) — it's an approximation from the
+	 * static markup, same as counting network waterfall entries by hand.
+	 */
+	private function crawl_url( $url ) {
+		$response = wp_remote_get( $url, array( 'timeout' => 15, 'redirection' => 3 ) );
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$code = wp_remote_retrieve_response_code( $response );
+		if ( $code < 200 || $code >= 400 ) {
+			return new WP_Error( 'fswp_crawl_bad_status', sprintf( 'Crawled URL returned HTTP %d.', $code ) );
+		}
+
+		$weight = 1 + $this->count_resource_tags( wp_remote_retrieve_body( $response ) );
+		$path   = $this->normalize_weight_path( $url );
+
+		$weights         = $this->get_url_weights();
+		$weights[ $path ] = array(
+			'weight'     => $weight,
+			'url'        => $url,
+			'crawled_at' => current_time( 'timestamp' ),
+		);
+		update_option( FSWP_RATE_LIMITER_WEIGHTS_OPTION, $weights, false );
+
+		return $weight;
+	}
+
+	private function count_resource_tags( $html ) {
+		if ( '' === trim( (string) $html ) ) {
+			return 0;
+		}
+
+		$dom = new DOMDocument();
+		libxml_use_internal_errors( true );
+		$dom->loadHTML( $html );
+		libxml_clear_errors();
+
+		$src_tags = array( 'img', 'script', 'source', 'iframe', 'video', 'audio', 'embed' );
+		$count    = 0;
+
+		foreach ( $src_tags as $tag ) {
+			foreach ( $dom->getElementsByTagName( $tag ) as $node ) {
+				if ( '' !== trim( (string) $node->getAttribute( 'src' ) ) ) {
+					$count++;
+				}
+				$count += $this->count_srcset_entries( $node );
+			}
+		}
+
+		foreach ( $dom->getElementsByTagName( 'object' ) as $node ) {
+			if ( '' !== trim( (string) $node->getAttribute( 'data' ) ) ) {
+				$count++;
+			}
+		}
+
+		foreach ( $dom->getElementsByTagName( 'link' ) as $node ) {
+			$rel = strtolower( (string) $node->getAttribute( 'rel' ) );
+			if ( preg_match( '/stylesheet|icon|preload|manifest|prefetch|preconnect/', $rel ) && '' !== trim( (string) $node->getAttribute( 'href' ) ) ) {
+				$count++;
+			}
+		}
+
+		return $count;
+	}
+
+	private function count_srcset_entries( $node ) {
+		if ( ! $node->hasAttribute( 'srcset' ) ) {
+			return 0;
+		}
+		$entries = array_filter( array_map( 'trim', explode( ',', $node->getAttribute( 'srcset' ) ) ) );
+		return count( $entries );
+	}
+
+	public function handle_crawl_url() {
+		if ( ! isset( $_POST['fswp_rate_limiter_crawl_url'] ) ) {
+			return;
+		}
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+		check_admin_referer( 'fswp_rate_limiter_crawl_url' );
+
+		$input = isset( $_POST['fswp_rate_limiter_crawl_url_value'] ) ? trim( (string) $_POST['fswp_rate_limiter_crawl_url_value'] ) : '';
+		if ( '' === $input ) {
+			return;
+		}
+
+		$url = ( 0 === strpos( $input, 'http://' ) || 0 === strpos( $input, 'https://' ) )
+			? $input
+			: home_url( '/' . ltrim( $input, '/' ) );
+
+		$site_host   = wp_parse_url( home_url(), PHP_URL_HOST );
+		$target_host = wp_parse_url( $url, PHP_URL_HOST );
+		if ( $target_host !== $site_host ) {
+			$this->notice = 'Only URLs on this site can be crawled.';
+			return;
+		}
+
+		$result = $this->crawl_url( $url );
+		$this->notice = is_wp_error( $result )
+			? 'Crawl failed: ' . $result->get_error_message()
+			: sprintf( 'Crawled %s — recorded weight %d.', $url, $result );
+	}
+
+	public function handle_weight_removals() {
+		if ( ! isset( $_POST['fswp_rate_limiter_remove_weights'] ) ) {
+			return;
+		}
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+		check_admin_referer( 'fswp_rate_limiter_remove_weights' );
+
+		$selected = isset( $_POST['fswp_rate_limiter_remove_weight_path'] ) ? array_map( 'sanitize_text_field', (array) $_POST['fswp_rate_limiter_remove_weight_path'] ) : array();
+		if ( empty( $selected ) ) {
+			return;
+		}
+
+		$weights = $this->get_url_weights();
+		foreach ( $selected as $path ) {
+			unset( $weights[ $path ] );
+		}
+		update_option( FSWP_RATE_LIMITER_WEIGHTS_OPTION, $weights, false );
 	}
 
 	/* ---------------------------------------------------------------------
@@ -527,6 +707,9 @@ final class FSWP_Rate_Limiter {
 		?>
 		<div class="wrap">
 			<h1>Rate Limiting</h1>
+			<?php if ( '' !== $this->notice ) : ?>
+				<div class="notice notice-info is-dismissible"><p><?php echo esc_html( $this->notice ); ?></p></div>
+			<?php endif; ?>
 			<p>Counter storage: <strong><?php echo $using_object_cache ? 'Persistent object cache (atomic)' : 'Transients / database (fallback)'; ?></strong>
 			<?php if ( ! $using_object_cache ) : ?>
 				&mdash; install a persistent object cache (e.g. Redis or Memcached) for fully atomic counting under heavy concurrent load.
@@ -645,6 +828,45 @@ final class FSWP_Rate_Limiter {
 				<p class="submit">
 					<input type="hidden" name="fswp_rate_limiter_remove_blocked_ips" value="1" />
 					<?php submit_button( 'Remove selected IPs', 'secondary', 'submit', false ); ?>
+				</p>
+			</form>
+
+			<h2>URL request weights</h2>
+			<p>Crawl a URL to record how many resource requests (images, scripts, stylesheets, etc.) one page load generates. When that URL is hit, the general limit counter is incremented by that number instead of 1 &mdash; approximating each page's real request cost, since WordPress itself never sees the browser's individual asset requests.</p>
+			<form method="post" action="">
+				<?php wp_nonce_field( 'fswp_rate_limiter_crawl_url' ); ?>
+				<input type="hidden" name="fswp_rate_limiter_crawl_url" value="1" />
+				<input type="text" name="fswp_rate_limiter_crawl_url_value" class="regular-text" placeholder="<?php echo esc_attr( home_url( '/' ) ); ?>" />
+				<?php submit_button( 'Crawl & save weight', 'secondary', 'submit', false ); ?>
+			</form>
+
+			<form method="post" action="">
+				<?php wp_nonce_field( 'fswp_rate_limiter_remove_weights' ); ?>
+				<table class="widefat fixed" role="presentation">
+					<thead>
+						<tr>
+							<th scope="col">Path</th>
+							<th scope="col">Weight</th>
+							<th scope="col">Crawled at</th>
+							<th scope="col">Remove</th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php $weights = $this->get_url_weights(); if ( ! empty( $weights ) ) : foreach ( $weights as $path => $entry ) : ?>
+							<tr>
+								<td><?php echo esc_html( $path ); ?></td>
+								<td><?php echo esc_html( $entry['weight'] ?? 1 ); ?></td>
+								<td><?php echo esc_html( gmdate( 'Y-m-d H:i:s', (int) ( $entry['crawled_at'] ?? 0 ) ) ); ?></td>
+								<td><label><input type="checkbox" name="fswp_rate_limiter_remove_weight_path[]" value="<?php echo esc_attr( $path ); ?>" /></label></td>
+							</tr>
+						<?php endforeach; else : ?>
+							<tr><td colspan="4">No URLs crawled yet &mdash; uncrawled paths count as weight 1.</td></tr>
+						<?php endif; ?>
+					</tbody>
+				</table>
+				<p class="submit">
+					<input type="hidden" name="fswp_rate_limiter_remove_weights" value="1" />
+					<?php submit_button( 'Remove selected', 'secondary', 'submit', false ); ?>
 				</p>
 			</form>
 		</div>
