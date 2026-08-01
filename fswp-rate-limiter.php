@@ -104,10 +104,12 @@ final class FSWP_Rate_Limiter {
 		$ip = $this->get_client_ip();
 
 		if ( $this->is_whitelisted( $ip ) ) {
+			$this->debug_log( "$ip skipped: whitelisted" );
 			return;
 		}
 
 		if ( $this->exempt_admin_user() ) {
+			$this->debug_log( "$ip skipped: exempt admin" );
 			return;
 		}
 
@@ -116,14 +118,17 @@ final class FSWP_Rate_Limiter {
 		}
 
 		if ( ! empty( $this->settings['exempt_wp_admin'] ) && $this->is_wp_admin_request() ) {
+			$this->debug_log( "$ip skipped: wp-admin exempt" );
 			return;
 		}
 
 		if ( empty( $this->settings['general_enabled'] ) ) {
+			$this->debug_log( "$ip skipped: general limit disabled" );
 			return;
 		}
 
 		if ( $this->is_excluded_url() ) {
+			$this->debug_log( "$ip skipped: excluded URL ({$_SERVER['REQUEST_URI']})" );
 			return;
 		}
 
@@ -149,16 +154,25 @@ final class FSWP_Rate_Limiter {
 
 		// Cheap path: already mitigating this IP, skip the counters entirely.
 		if ( $this->cache_get( $block_key ) ) {
+			$this->debug_log( "$ip already mitigated ($bucket)" );
 			$this->log_blocked_ip( $ip, 'rate-limit', $bucket );
 			$this->send_429( $mitigation );
 		}
 
 		$rate = $this->sliding_window_rate( $bucket, $ip, $window );
 
+		$this->debug_log( "$ip $bucket rate=$rate limit=$limit" );
+
 		if ( $rate > $limit ) {
 			$this->cache_set( $block_key, 1, $mitigation );
 			$this->log_blocked_ip( $ip, 'rate-limit', $bucket );
 			$this->send_429( $mitigation );
+		}
+	}
+
+	private function debug_log( $message ) {
+		if ( defined( 'FSWP_RATE_LIMITER_DEBUG' ) && FSWP_RATE_LIMITER_DEBUG ) {
+			error_log( '[fswp-rate-limiter] ' . $message );
 		}
 	}
 
