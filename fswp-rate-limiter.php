@@ -54,6 +54,8 @@ require_once FSWP_RATE_LIMITER_DIR . 'includes/class-fswp-storage.php';
 require_once FSWP_RATE_LIMITER_DIR . 'includes/class-fswp-crawler.php';
 require_once FSWP_RATE_LIMITER_DIR . 'includes/class-fswp-rate-limiter.php';
 
+register_activation_hook( FSWP_RATE_LIMITER_FILE, array( 'FSWP_Rate_Limiter', 'on_activate' ) );
+
 add_action( 'init', function () {
 	load_plugin_textdomain( 'fswp-rate-limiter', false, dirname( plugin_basename( FSWP_RATE_LIMITER_FILE ) ) . '/languages' );
 } );

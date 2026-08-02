@@ -23,6 +23,57 @@ final class FSWP_Rate_Limiter {
 		return self::$instance;
 	}
 
+	/**
+	 * Runs once on plugin activation: add the server's own IP to the
+	 * whitelist so the server can never rate-limit itself (loopback
+	 * requests, WP-Cron pinging its own site, local health checks, etc.).
+	 */
+	public static function on_activate() {
+		$ip = self::detect_server_ip();
+		if ( '' === $ip ) {
+			return;
+		}
+
+		$settings = wp_parse_args( get_option( FSWP_RATE_LIMITER_OPTION, array() ), self::default_settings() );
+		$list     = array_filter( array_map( 'trim', explode( "\n", (string) $settings['whitelist_ips'] ) ) );
+		if ( in_array( $ip, $list, true ) ) {
+			return;
+		}
+
+		$list[]                    = $ip;
+		$settings['whitelist_ips'] = implode( "\n", $list );
+		update_option( FSWP_RATE_LIMITER_OPTION, $settings );
+	}
+
+	private static function detect_server_ip() {
+		$candidates = array();
+		if ( ! empty( $_SERVER['SERVER_ADDR'] ) ) {
+			$candidates[] = $_SERVER['SERVER_ADDR'];
+		}
+		if ( ! empty( $_SERVER['LOCAL_ADDR'] ) ) {
+			// IIS uses LOCAL_ADDR instead of SERVER_ADDR.
+			$candidates[] = $_SERVER['LOCAL_ADDR'];
+		}
+
+		$hostname = gethostname();
+		if ( $hostname ) {
+			$resolved = gethostbyname( $hostname );
+			// gethostbyname() returns the input unchanged when it can't resolve.
+			if ( $resolved && $resolved !== $hostname ) {
+				$candidates[] = $resolved;
+			}
+		}
+
+		foreach ( $candidates as $candidate ) {
+			$ip = filter_var( $candidate, FILTER_VALIDATE_IP );
+			if ( $ip ) {
+				return $ip;
+			}
+		}
+
+		return '';
+	}
+
 	private function __construct() {
 		$this->settings = wp_parse_args( get_option( FSWP_RATE_LIMITER_OPTION, array() ), self::default_settings() );
 
