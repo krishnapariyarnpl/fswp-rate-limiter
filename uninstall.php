@@ -12,6 +12,11 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 delete_option( 'fswp_rate_limiter_settings' );
 delete_option( 'fswp_rate_limiter_block_log' );
 delete_option( 'fswp_rate_limiter_url_weights' );
+delete_option( 'fswp_rate_limiter_initial_crawl_urls' );
+delete_option( 'fswp_rate_limiter_initial_crawl_offset' );
+delete_option( 'fswp_rate_limiter_initial_crawl_result' );
+
+wp_clear_scheduled_hook( 'fswp_rate_limiter_initial_crawl_batch' );
 
 global $wpdb;
 $like = $wpdb->esc_like( 'fswp_rate_limiter_' ) . '%';

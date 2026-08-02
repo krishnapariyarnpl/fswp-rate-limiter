@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       FSWP Rate Limiter
  * Description:       Per-IP rate limiting for WordPress using a Cloudflare-style sliding-window counter. Protects the whole site from floods and brute force by counting every request that reaches WordPress, including frontend, admin, AJAX, login, and XML-RPC endpoints, and responds with HTTP 429.
- * Version:           1.1.0
+ * Version:           1.2.0
  * Requires at least: 5.6
  * Requires PHP:      7.4
  * Author:            Custom
@@ -43,7 +43,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'FSWP_RATE_LIMITER_VERSION', '1.1.0' );
+define( 'FSWP_RATE_LIMITER_VERSION', '1.2.0' );
 define( 'FSWP_RATE_LIMITER_FILE', __FILE__ );
 define( 'FSWP_RATE_LIMITER_DIR', plugin_dir_path( __FILE__ ) );
 define( 'FSWP_RATE_LIMITER_OPTION', 'fswp_rate_limiter_settings' );
@@ -55,6 +55,7 @@ require_once FSWP_RATE_LIMITER_DIR . 'includes/class-fswp-crawler.php';
 require_once FSWP_RATE_LIMITER_DIR . 'includes/class-fswp-rate-limiter.php';
 
 register_activation_hook( FSWP_RATE_LIMITER_FILE, array( 'FSWP_Rate_Limiter', 'on_activate' ) );
+register_deactivation_hook( FSWP_RATE_LIMITER_FILE, array( 'FSWP_Rate_Limiter', 'on_deactivate' ) );
 
 add_action( 'init', function () {
 	load_plugin_textdomain( 'fswp-rate-limiter', false, dirname( plugin_basename( FSWP_RATE_LIMITER_FILE ) ) . '/languages' );

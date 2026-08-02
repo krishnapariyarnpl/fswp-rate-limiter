@@ -11,6 +11,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class FSWP_Rate_Limiter {
 
+	const INITIAL_CRAWL_HOOK          = 'fswp_rate_limiter_initial_crawl_batch';
+	const INITIAL_CRAWL_URLS_OPTION   = 'fswp_rate_limiter_initial_crawl_urls';
+	const INITIAL_CRAWL_OFFSET_OPTION = 'fswp_rate_limiter_initial_crawl_offset';
+	const INITIAL_CRAWL_RESULT_OPTION = 'fswp_rate_limiter_initial_crawl_result';
+	const INITIAL_CRAWL_BATCH_SIZE    = 10;
+
 	private static $instance = null;
 
 	/** @var array */
@@ -26,23 +32,137 @@ final class FSWP_Rate_Limiter {
 	/**
 	 * Runs once on plugin activation: add the server's own IP to the
 	 * whitelist so the server can never rate-limit itself (loopback
-	 * requests, WP-Cron pinging its own site, local health checks, etc.).
+	 * requests, WP-Cron pinging its own site, local health checks, etc.),
+	 * and — on a genuinely fresh install only — schedule a background
+	 * crawl of every endpoint to calculate and apply an optimal site-wide
+	 * limit instead of leaving the generic default in place.
 	 */
 	public static function on_activate() {
+		$is_fresh_install = ( false === get_option( FSWP_RATE_LIMITER_OPTION, false ) );
+
 		$ip = self::detect_server_ip();
-		if ( '' === $ip ) {
+		if ( '' !== $ip ) {
+			$settings = wp_parse_args( get_option( FSWP_RATE_LIMITER_OPTION, array() ), self::default_settings() );
+			$list     = array_filter( array_map( 'trim', explode( "\n", (string) $settings['whitelist_ips'] ) ) );
+			if ( ! in_array( $ip, $list, true ) ) {
+				$list[]                    = $ip;
+				$settings['whitelist_ips'] = implode( "\n", $list );
+				update_option( FSWP_RATE_LIMITER_OPTION, $settings );
+			}
+		}
+
+		if ( $is_fresh_install ) {
+			self::schedule_initial_crawl();
+		}
+	}
+
+	public static function on_deactivate() {
+		wp_clear_scheduled_hook( self::INITIAL_CRAWL_HOOK );
+	}
+
+	private static function schedule_initial_crawl() {
+		if ( wp_next_scheduled( self::INITIAL_CRAWL_HOOK ) ) {
+			return;
+		}
+		update_option( self::INITIAL_CRAWL_URLS_OPTION, FSWP_Crawler::discover_endpoints(), false );
+		update_option( self::INITIAL_CRAWL_OFFSET_OPTION, 0, false );
+		wp_schedule_single_event( time() + 10, self::INITIAL_CRAWL_HOOK );
+	}
+
+	/**
+	 * One batch of the background initial crawl. Reschedules itself until
+	 * every discovered URL has been crawled, then calculates the optimal
+	 * limit from the average recorded weight. Kept small per run (see
+	 * INITIAL_CRAWL_BATCH_SIZE) so it can't hit PHP's max_execution_time,
+	 * the same reasoning as the admin-triggered auto-crawl.
+	 */
+	public function run_initial_crawl_batch() {
+		$urls = get_option( self::INITIAL_CRAWL_URLS_OPTION, array() );
+		if ( ! is_array( $urls ) || empty( $urls ) ) {
+			$this->finish_initial_crawl();
 			return;
 		}
 
-		$settings = wp_parse_args( get_option( FSWP_RATE_LIMITER_OPTION, array() ), self::default_settings() );
-		$list     = array_filter( array_map( 'trim', explode( "\n", (string) $settings['whitelist_ips'] ) ) );
-		if ( in_array( $ip, $list, true ) ) {
+		$offset = (int) get_option( self::INITIAL_CRAWL_OFFSET_OPTION, 0 );
+		$batch  = array_slice( $urls, $offset, self::INITIAL_CRAWL_BATCH_SIZE );
+
+		foreach ( $batch as $url ) {
+			FSWP_Crawler::crawl( $url );
+		}
+
+		$offset += count( $batch );
+
+		if ( $offset < count( $urls ) ) {
+			update_option( self::INITIAL_CRAWL_OFFSET_OPTION, $offset, false );
+			wp_schedule_single_event( time() + 30, self::INITIAL_CRAWL_HOOK );
 			return;
 		}
 
-		$list[]                    = $ip;
-		$settings['whitelist_ips'] = implode( "\n", $list );
-		update_option( FSWP_RATE_LIMITER_OPTION, $settings );
+		$this->finish_initial_crawl();
+	}
+
+	private function finish_initial_crawl() {
+		delete_option( self::INITIAL_CRAWL_URLS_OPTION );
+		delete_option( self::INITIAL_CRAWL_OFFSET_OPTION );
+
+		$average = FSWP_Crawler::average_weight();
+		if ( null === $average ) {
+			return;
+		}
+
+		$defaults = self::default_settings();
+		$settings = wp_parse_args( get_option( FSWP_RATE_LIMITER_OPTION, array() ), $defaults );
+
+		$applied = false;
+		// Don't clobber a limit the admin has already changed themselves
+		// in the meantime — only apply the calculated value while it's
+		// still sitting at the built-in default.
+		if ( (int) $settings['general_limit'] === (int) $defaults['general_limit'] ) {
+			$settings['general_limit'] = self::calculate_optimal_limit( $average );
+			update_option( FSWP_RATE_LIMITER_OPTION, $settings );
+			$applied = true;
+		}
+
+		update_option( self::INITIAL_CRAWL_RESULT_OPTION, array(
+			'endpoints'   => count( FSWP_Crawler::get_weights() ),
+			'average'     => $average,
+			'limit'       => $settings['general_limit'],
+			'applied'     => $applied,
+			'finished_at' => current_time( 'timestamp' ),
+		), false );
+	}
+
+	/**
+	 * A human browsing quickly might open a new page every few seconds;
+	 * 20 page loads within a 60-second window is a generous upper bound
+	 * that still comfortably excludes an automated flood. Multiplying by
+	 * the average recorded page weight converts that into the same
+	 * weighted-hit units the counter itself uses, so heavier sites (more
+	 * assets per page) get a proportionally higher limit.
+	 */
+	private static function calculate_optimal_limit( $average_weight ) {
+		$pages_per_window = (int) apply_filters( 'fswp_rate_limiter_pages_per_window', 20 );
+		return max( 60, (int) round( $average_weight * $pages_per_window ) );
+	}
+
+	/**
+	 * @return array{processed:int,total:int}|null Progress of the
+	 *         in-progress background crawl, or null if none is running.
+	 */
+	public static function get_initial_crawl_status() {
+		$urls = get_option( self::INITIAL_CRAWL_URLS_OPTION, false );
+		if ( false === $urls || ! is_array( $urls ) ) {
+			return null;
+		}
+		return array(
+			'processed' => (int) get_option( self::INITIAL_CRAWL_OFFSET_OPTION, 0 ),
+			'total'     => count( $urls ),
+		);
+	}
+
+	public static function get_initial_crawl_result() {
+		$result = get_option( self::INITIAL_CRAWL_RESULT_OPTION, false );
+		return is_array( $result ) ? $result : null;
 	}
 
 	private static function detect_server_ip() {
@@ -81,6 +201,8 @@ final class FSWP_Rate_Limiter {
 		// wp-login.php, xmlrpc.php, wp-admin/admin-ajax.php, ...), and
 		// fires as early as possible so we do minimal work before blocking.
 		add_action( 'plugins_loaded', array( $this, 'maybe_enforce' ), 1 );
+
+		add_action( self::INITIAL_CRAWL_HOOK, array( $this, 'run_initial_crawl_batch' ) );
 	}
 
 	public static function default_settings() {

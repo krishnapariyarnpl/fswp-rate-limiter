@@ -96,6 +96,24 @@ final class FSWP_Crawler {
 		return array_values( array_unique( $urls ) );
 	}
 
+	/**
+	 * Average weight across every URL crawled so far, or null if nothing
+	 * has been crawled yet.
+	 */
+	public static function average_weight() {
+		$weights = self::get_weights();
+		if ( empty( $weights ) ) {
+			return null;
+		}
+
+		$sum = 0;
+		foreach ( $weights as $entry ) {
+			$sum += isset( $entry['weight'] ) ? (int) $entry['weight'] : 1;
+		}
+
+		return $sum / count( $weights );
+	}
+
 	public static function remove( array $paths ) {
 		$weights = self::get_weights();
 		foreach ( $paths as $path ) {

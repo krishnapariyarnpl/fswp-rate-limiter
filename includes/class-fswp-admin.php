@@ -392,6 +392,50 @@ final class FSWP_Admin {
 			<?php endif; ?>
 			<p><?php esc_html_e( "Crawl a URL to record how many resource requests (images, scripts, stylesheets, etc.) one page load generates. When that URL is hit, the general limit counter is incremented by that number instead of 1 — approximating each page's real request cost, since WordPress itself never sees the browser's individual asset requests.", 'fswp-rate-limiter' ); ?></p>
 
+			<?php $status = FSWP_Rate_Limiter::get_initial_crawl_status(); ?>
+			<?php if ( null !== $status ) : ?>
+				<div class="notice notice-info inline">
+					<p>
+						<?php
+						printf(
+							/* translators: 1: number of endpoints crawled so far, 2: total endpoints to crawl. */
+							esc_html__( 'Calculating the optimal site-wide limit in the background: crawled %1$d of %2$d endpoints so far. This runs automatically via WordPress Cron and continues even if you leave this page — check back shortly.', 'fswp-rate-limiter' ),
+							(int) $status['processed'],
+							(int) $status['total']
+						);
+						?>
+					</p>
+				</div>
+			<?php endif; ?>
+
+			<?php $result = FSWP_Rate_Limiter::get_initial_crawl_result(); ?>
+			<?php if ( null !== $result ) : ?>
+				<div class="notice notice-success inline">
+					<p>
+						<?php if ( ! empty( $result['applied'] ) ) : ?>
+							<?php
+							printf(
+								/* translators: 1: number of endpoints crawled, 2: average weight, 3: calculated requests-per-60s limit. */
+								esc_html__( 'Initial auto-crawl complete: %1$d endpoints crawled, average weight %2$s. Set the site-wide limit to %3$d requests per 60 seconds on the Settings page — adjust it anytime.', 'fswp-rate-limiter' ),
+								(int) $result['endpoints'],
+								esc_html( number_format_i18n( $result['average'], 1 ) ),
+								(int) $result['limit']
+							);
+							?>
+						<?php else : ?>
+							<?php
+							printf(
+								/* translators: 1: number of endpoints crawled, 2: average weight. */
+								esc_html__( 'Initial auto-crawl complete: %1$d endpoints crawled, average weight %2$s. The site-wide limit was left as-is since it had already been changed from the default.', 'fswp-rate-limiter' ),
+								(int) $result['endpoints'],
+								esc_html( number_format_i18n( $result['average'], 1 ) )
+							);
+							?>
+						<?php endif; ?>
+					</p>
+				</div>
+			<?php endif; ?>
+
 			<h2><?php esc_html_e( 'Auto-crawl the whole site', 'fswp-rate-limiter' ); ?></h2>
 			<p><?php esc_html_e( 'Discovers every published post, page, custom post type entry, and public taxonomy archive on the site, then crawls each one a few at a time in the background to record its weight. Safe for large sites — it never processes more than a handful of URLs per request, so it can\'t time out.', 'fswp-rate-limiter' ); ?></p>
 			<p>
